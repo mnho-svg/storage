@@ -1,0 +1,502 @@
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UI;
+using System.Text;
+using Unity.Netcode;
+using Unity.Netcode.Transports.UTP;
+using Unity.Collections;
+
+public class 联机功能 : MonoBehaviour
+{
+    [Header("UI 组件 - 网络控制")]
+    public InputField 服务器IP输入框;
+    public Button 创建主机按钮;
+    public Button 连接服务器按钮;
+    
+    [Header("UI 组件 - 玩家信息")]
+    public InputField 玩家名字输入框;
+    public Button matchButton;
+    public Button cancelButton;
+    public Text resultText;
+    
+    [Header("网络设置")]
+    public string serverIP = "127.0.0.1";
+    public ushort port = 7777;
+    
+    private NetworkManager networkManager;
+    private UnityTransport transport;
+    
+    private string 当前服务器地址 = "";
+    private string 我的玩家名字 = "";
+    
+    public static 联机功能 Instance { get; private set; }
+    
+    void Awake()
+{
+    // 清理可能残留的 NetworkManager
+    var oldNetworkManagers = FindObjectsOfType<NetworkManager>();
+    foreach (var nm in oldNetworkManagers)
+    {
+        if (nm.IsListening)
+            nm.Shutdown();
+    }
+    
+    if (Instance == null)
+        Instance = this;
+    else
+    {
+        Destroy(gameObject);
+        return;
+    }
+    
+    DontDestroyOnLoad(gameObject);
+}
+    
+    void Start()
+    {
+        初始化网络管理器 ();
+        
+        if (创建主机按钮 != null)
+            创建主机按钮.onClick.AddListener(创建主机);
+        
+        if (连接服务器按钮 != null)
+            连接服务器按钮.onClick.AddListener(连接服务器);
+        
+        if (matchButton != null)
+            matchButton.onClick.AddListener(快速匹配);
+        
+        if (cancelButton != null)
+            cancelButton.onClick.AddListener(断开连接);
+        
+        // ✅ 修复：延迟一帧调用 UpdateUIState，确保 networkManager 状态正确
+        StartCoroutine(延迟更新UI());
+        
+        if (服务器IP输入框 != null && string.IsNullOrEmpty(服务器IP输入框.text))
+            服务器IP输入框.text = serverIP;
+    }
+    
+    // ✅ 新增：延迟更新UI 状态
+    private System.Collections.IEnumerator 延迟更新UI()
+    {
+        yield return null;  // 等待一帧
+        UpdateUIState();
+    }
+    void OnDestroy()
+    {
+        if (创建主机按钮 != null)
+            创建主机按钮.onClick.RemoveListener(创建主机);
+        
+        if (连接服务器按钮 != null)
+            连接服务器按钮.onClick.RemoveListener(连接服务器);
+        
+        if (matchButton != null)
+            matchButton.onClick.RemoveListener(快速匹配);
+        
+        if (cancelButton != null)
+            cancelButton.onClick.RemoveListener(断开连接);
+        
+        if (networkManager != null)
+        {
+            networkManager.OnClientConnectedCallback -= OnClientConnected;
+            networkManager.OnClientDisconnectCallback -= OnClientDisconnect;
+        }
+        
+        // ✅ 修复：场景切换时清理单例
+        if (Instance == this)
+            Instance = null;
+    }
+    
+    private void 初始化网络管理器 ()
+    {
+        // ✅ 修复：如果已存在且正在运行，先关闭
+        if (networkManager != null)
+        {
+            if (networkManager.IsListening)
+            {
+                networkManager.Shutdown();
+            }
+            return;
+        }
+        
+        GameObject networkObj = new GameObject("NetworkManager");
+        networkManager = networkObj.AddComponent<NetworkManager>();
+        transport = networkObj.AddComponent<UnityTransport>();
+        
+        transport.SetConnectionData(serverIP, port, "");
+        
+        networkManager.NetworkConfig = new NetworkConfig
+        {
+            NetworkTransport = transport,
+            PlayerPrefab = null,
+            EnableSceneManagement = true,
+            TickRate = 30,
+            ConnectionApproval = false
+        };
+        
+        networkManager.OnClientConnectedCallback += OnClientConnected;
+        networkManager.OnClientDisconnectCallback += OnClientDisconnect;
+        
+        // 添加玩家网络同步组件
+        networkObj.AddComponent<玩家网络同步>();
+        
+        DontDestroyOnLoad(networkObj);
+        
+        // ✅ 修复：确保初始状态是未连接
+        Debug.Log($"[初始化] networkManager 创建完成，IsConnectedClient={networkManager.IsConnectedClient}, IsListening={networkManager.IsListening}");
+    }
+    
+    private void OnClientConnected(ulong clientId)
+    {
+        Debug.Log($"客户端已连接：{clientId}");
+        
+        if (clientId == networkManager.LocalClientId)
+        {
+            Debug.Log("✓ 本地客户端连接成功");
+            
+            if (!string.IsNullOrEmpty(我的玩家名字))
+            {
+                玩家网络同步.Instance.请求加入服务器_ServerRpc(
+                    clientId, 
+                    new FixedString32Bytes(我的玩家名字)
+                );
+            }
+            
+            UpdateUIState();
+        }
+    }
+    
+    private void OnClientDisconnect(ulong clientId)
+    {
+        Debug.Log($"客户端断开连接：{clientId}");
+        
+        if (clientId == networkManager.LocalClientId)
+        {
+            resultText.text = "已断开连接";
+            UpdateUIState();
+        }
+    }
+    
+    public void 创建主机 ()
+    {
+        // ✅ 修复：添加更详细的检查
+        if (networkManager == null)
+        {
+            Debug.LogError("networkManager 为 null，重新初始化");
+            初始化网络管理器 ();
+        }
+        
+        if (networkManager.IsConnectedClient || networkManager.IsListening)
+        {
+            resultText.text = "无法创建主机：已连接或正在监听";
+            Debug.LogWarning($"无法创建：IsConnectedClient={networkManager.IsConnectedClient}, IsListening={networkManager.IsListening}");
+            return;
+        }
+        
+        我的玩家名字 = 获取玩家名字 ();
+        if (string.IsNullOrEmpty(我的玩家名字))
+        {
+            resultText.text = "请输入玩家名字！";
+            return;
+        }
+        
+        string hostIP;
+        if (服务器IP输入框 != null && !string.IsNullOrEmpty(服务器IP输入框.text))
+        {
+            hostIP = 服务器IP输入框.text.Trim();
+        }
+        else
+        {
+            hostIP = GetLocalIPAddress();
+        }
+        
+        serverIP = hostIP;
+        transport.SetConnectionData(serverIP, port, "");
+        
+        networkManager.StartHost();
+        
+        当前服务器地址 = $"{serverIP}:{port}";
+        
+        resultText.text = $"✓ 已创建主机！地址：{当前服务器地址} | 名字：{我的玩家名字}";
+        
+        Debug.Log($"主机已启动，服务器地址：{当前服务器地址}");
+        UpdateUIState();
+    }
+    
+    public void 连接服务器 ()
+    {
+        if (networkManager == null)
+        {
+            Debug.LogError("networkManager 为 null，重新初始化");
+            初始化网络管理器 ();
+        }
+        
+        if (networkManager.IsConnectedClient || networkManager.IsListening)
+        {
+            resultText.text = "无法连接：已连接或正在监听";
+            return;
+        }
+        
+        我的玩家名字 = 获取玩家名字 ();
+        if (string.IsNullOrEmpty(我的玩家名字))
+        {
+            resultText.text = "请输入玩家名字！";
+            return;
+        }
+        
+        string targetIP = 服务器IP输入框.text.Trim();
+        if (string.IsNullOrEmpty(targetIP))
+        {
+            resultText.text = "请输入服务器 IP 地址！";
+            return;
+        }
+        
+        transport.SetConnectionData(targetIP, port, "");
+        
+        Debug.Log($"准备连接到服务器：{targetIP}:{port}");
+        resultText.text = $"正在连接 {targetIP}:{port}...";
+        
+        networkManager.StartClient();
+        UpdateUIState();
+    }
+    
+    public void 快速匹配 ()
+    {
+        if (networkManager == null)
+        {
+            Debug.LogError("networkManager 为 null，重新初始化");
+            初始化网络管理器 ();
+        }
+        
+        if (networkManager.IsConnectedClient || networkManager.IsListening)
+        {
+            resultText.text = "无法匹配：已连接或正在监听";
+            return;
+        }
+        
+        我的玩家名字 = 获取玩家名字 ();
+        if (string.IsNullOrEmpty(我的玩家名字))
+        {
+            resultText.text = "请输入玩家名字！";
+            return;
+        }
+        
+        serverIP = "127.0.0.1";
+        transport.SetConnectionData(serverIP, port, "");
+        
+        resultText.text = $"正在尝试匹配...";
+        
+        Debug.Log("[快速匹配] 尝试创建主机...");
+        networkManager.StartHost();
+        
+        当前服务器地址 = $"{serverIP}:{port}";
+        
+        resultText.text = $"✓ 已创建服务器！地址：{当前服务器地址}";
+        
+        Debug.Log($"[快速匹配] 创建主机成功");
+        UpdateUIState();
+    }
+    
+    public void 断开连接 ()
+    {
+        if (networkManager != null && (networkManager.IsConnectedClient || networkManager.IsListening))
+        {
+            networkManager.Shutdown();
+            resultText.text = "已断开连接";
+            UpdateUIState();
+        }
+    }
+    
+    public void 更新玩家列表显示 (string 列表文本)
+    {
+        if (resultText != null)
+        {
+            resultText.text = 列表文本;
+        }
+    }
+    
+    private string 获取玩家名字 ()
+    {
+        if (玩家名字输入框 != null && !string.IsNullOrEmpty(玩家名字输入框.text))
+        {
+            return 玩家名字输入框.text.Trim();
+        }
+        return "";
+    }
+    
+    private void UpdateUIState()
+    {
+        // ✅ 修复：添加 null 检查和更准确的状态判断
+        bool isConnected = networkManager != null && (networkManager.IsConnectedClient || networkManager.IsListening);
+        
+        Debug.Log($"[UI 状态] isConnected={isConnected}, IsConnectedClient={networkManager?.IsConnectedClient}, IsListening={networkManager?.IsListening}");
+        
+        if (创建主机按钮 != null)
+            创建主机按钮.interactable = !isConnected;
+        
+        if (连接服务器按钮 != null)
+            连接服务器按钮.interactable = !isConnected;
+        
+        if (服务器IP输入框 != null)
+            服务器IP输入框.interactable = !isConnected;
+        
+        if (玩家名字输入框 != null)
+            玩家名字输入框.interactable = !isConnected;
+        
+        if (matchButton != null)
+            matchButton.interactable = !isConnected;
+        
+        if (cancelButton != null)
+        {
+            cancelButton.interactable = isConnected;
+            cancelButton.GetComponentInChildren<Text>().text = isConnected ? "断开连接" : "取消";
+        }
+    }
+    
+    public bool IsServer => networkManager != null && networkManager.IsServer;
+    
+    private string GetLocalIPAddress()
+    {
+        string localIP = "127.0.0.1";
+        
+        try
+        {
+            string hostName = System.Net.Dns.GetHostName();
+            System.Net.IPAddress[] addresses = System.Net.Dns.GetHostAddresses(hostName);
+            
+            foreach (System.Net.IPAddress address in addresses)
+            {
+                if (address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                {
+                    if (!address.ToString().StartsWith("127."))
+                    {
+                        localIP = address.ToString();
+                        break;
+                    }
+                }
+            }
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"获取本地 IP 失败：{e.Message}");
+        }
+        
+        return localIP;
+    }
+}
+
+using System;
+using System.Collections.Generic;
+using System.Text;
+using Unity.Netcode;
+using Unity.Collections;
+using UnityEngine;
+
+public class 玩家网络同步 : NetworkBehaviour
+{
+    private NetworkList<PlayerInfo> 玩家列表 = new NetworkList<PlayerInfo>();
+    
+    public struct PlayerInfo : INetworkSerializable, IEquatable<PlayerInfo>
+    {
+        public ulong ClientId;
+        public FixedString32Bytes PlayerName;
+        
+        public void NetworkSerialize<T>(BufferSerializer<T> serializer) where T : IReaderWriter
+        {
+            serializer.SerializeValue(ref ClientId);
+            serializer.SerializeValue(ref PlayerName);
+        }
+        
+        public bool Equals(PlayerInfo other)
+        {
+            return ClientId == other.ClientId;
+        }
+        
+        public override bool Equals(object obj)
+        {
+            return obj is PlayerInfo other && Equals(other);
+        }
+        
+        public override int GetHashCode()
+        {
+            return ClientId.GetHashCode();
+        }
+    }
+    
+    public static 玩家网络同步 Instance { get; private set; }
+    
+    void Awake()
+    {
+        if (Instance == null)
+            Instance = this;
+        else
+            Destroy(gameObject);
+    }
+    
+    void Start()
+    {
+        玩家列表.OnListChanged += 玩家列表更新;
+    }
+    
+    public new void OnDestroy()
+    {
+        玩家列表.OnListChanged -= 玩家列表更新;
+        
+        if (IsServer && NetworkManager != null)
+        {
+            ulong clientId = NetworkManager.LocalClientId;
+            for (int i = 0; i < 玩家列表.Count; i++)
+            {
+                if (玩家列表[i].ClientId == clientId)
+                {
+                    玩家列表.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+    }
+    
+    [ServerRpc]
+    public void 请求加入服务器_ServerRpc(ulong clientId, FixedString32Bytes playerName)
+    {
+        foreach (var info in 玩家列表)
+        {
+            if (info.ClientId == clientId)
+            {
+                Debug.Log($"玩家已存在：{info.PlayerName}");
+                return;
+            }
+        }
+        
+        玩家列表.Add(new PlayerInfo { ClientId = clientId, PlayerName = playerName });
+        Debug.Log($"玩家加入：{playerName} (ID: {clientId})");
+    }
+    
+    private void 玩家列表更新 (NetworkListEvent<PlayerInfo> 变化)
+    {
+        if (联机功能.Instance != null)
+        {
+            联机功能.Instance.更新玩家列表显示 (获取玩家列表文本 ());
+        }
+    }
+    
+    private string 获取玩家列表文本 ()
+    {
+        StringBuilder sb = new StringBuilder();
+        sb.Append($"在线：{玩家列表.Count}人 | ");
+        
+        for (int i = 0; i < 玩家列表.Count; i++)
+        {
+            sb.Append(玩家列表[i].PlayerName.ToString());
+            if (i < 玩家列表.Count - 1)
+                sb.Append("、");
+        }
+        
+        return sb.ToString();
+    }
+    
+    public int 获取玩家数量 ()
+    {
+        return 玩家列表.Count;
+    }
+}
